@@ -1,4 +1,4 @@
-#import cv2
+
 import cv2
 import numpy as np
 
@@ -58,5 +58,6 @@ if len(goods)>4:
 
 # cv2.imshow('Anh so khop dac trung',img)
 # cv2.waitKey(0)
+
 
 
