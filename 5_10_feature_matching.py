@@ -47,8 +47,26 @@ def multiband_blend(img1, img2, mask, levels=6):
         blended = blended + LS[i]
 
     return np.clip(blended, 0, 255).astype(np.uint8)
+# Ghép Nhiều ảnh
+# load ảnh
+#  Folder chứa ảnh
+folder = "imgs"  # đổi theo folder 
+image_files = sorted([f for f in os.listdir(folder) if f.lower().endswith(('.jpg', '.png'))])
 
+# Load tất cả ảnh
+images = [cv2.imread(os.path.join(folder, f)) for f in image_files]
 
+if len(images) < 2:
+    raise RuntimeError("Can it nhat 2 anh de ghep.")
+
+# Ghép nhiều ảnh 
+panorama = images[0]
+
+for i in range(1, len(images)):
+    img1 = panorama 
+    img2 = images[i] 
+
+    print(f"Dang ghep anh {i+1}/{len(images)} ...")
 
 img1 = cv2.imread('anh1.jpg')
 img2 = cv2.imread('anh2.jpg')
@@ -119,3 +137,4 @@ final_resize = cv2.resize(final_crop, (1000, 500))
 cv2.imshow('Panorama', final_resize)
 cv2.waitKey(0)
 cv2.destroyAllWindows()
+
