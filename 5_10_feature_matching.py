@@ -1,182 +1,269 @@
-import cv2, numpy as np, os, gc
+import cv2
+import numpy as np
+import os
+import re
+import gc
+import gradio as gr
 
-# ==============================================================================
-# CẤU HÌNH (Max Detail + De-Ghosting)
-# ==============================================================================
-MIN_MATCH, RANSAC, LOWE = 8, 4.0, 0.70
-BLEND_LVL, BORDER = 3, 3
-MAX_PIX = 300_000_000 
+# --- CẤU HÌNH ---
+MAX_W = 1200       # Giới hạn chiều ngang để xử lý nhanh hơn
+ORB_N = 10000      # Số lượng điểm đặc trưng tối đa
+FOCAL_LENGTH = 1500 # Tiêu cự giả định (Tăng lên để giảm độ cong ảnh)
 
-# ==============================================================================
-# CÁC HÀM HỖ TRỢ
-# ==============================================================================
-def crop(img):
-    _, t = cv2.threshold(cv2.cvtColor(img, 6), 1, 255, 0); c = cv2.findNonZero(t)
-    if c is None: return img
-    x, y, w, h = cv2.boundingRect(c); return img[y:y+h, x:x+w]
-
-def get_mask(img):
-    h, w = img.shape[:2]; m = np.ones((h, w), np.uint8) * 255
-    m[:BORDER,:]=0; m[-BORDER:,:]=0; m[:,:BORDER]=0; m[:,-BORDER:]=0
-    d = cv2.distanceTransform(m, cv2.DIST_L2, 3); return (d/d.max())**0.5 if d.max()>0 else d
-
-def match_exp(ref, tgt, wm_r, wm_t):
-    s = 4; ov = (wm_r[::s,::s]>0.01) & (wm_t[::s,::s]>0.01)
-    if np.sum(ov)<100: return tgt
-    d = np.clip(np.mean(cv2.cvtColor(ref[::s,::s],44)[:,:,0][ov]) - np.mean(cv2.cvtColor(tgt[::s,::s],44)[:,:,0][ov]), -20, 20)
-    return cv2.LUT(tgt, np.array([i+d for i in range(256)]).clip(0,255).astype("uint8")) if abs(d)>1 else tgt
-
-# ==============================================================================
-# HÀM BLEND CẢI TIẾN: TÍCH HỢP XÓA BÓNG MA (SEAM CUTTING)
-# ==============================================================================
-def blend(can, img, wc, wi):
-    # 1. Tìm vùng giao nhau (ROI)
-    y, x = np.where(wi > 0)
-    if not len(y): return can
-    ym, yM, xm, xM = y.min(), y.max(), x.min(), x.max()
+# --- 1. KỸ THUẬT: WARP PERSPECTIVE / CYLINDRICAL ---
+def cylindrical_warp(img, f):
+    h, w = img.shape[:2]
+    K = np.array([[f, 0, w/2], [0, f, h/2], [0, 0, 1]])
+    y, x = np.indices((h, w))
+    X = np.linalg.inv(K).dot(np.stack([x, y, np.ones_like(x)], -1).reshape(h*w, 3).T).T
+    B = K.dot(np.stack([np.sin(X[:,0]), X[:,1], np.cos(X[:,0])], -1).reshape(h*w, 3).T).T
+    B = (B[:, :-1] / B[:, [-1]]).reshape(h, w, 2)
+    img_cyl = cv2.remap(img, B[:,:,0].astype(np.float32), B[:,:,1].astype(np.float32), cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
     
-    # Mở rộng vùng đệm để chạy Pyramid
-    p = 2**BLEND_LVL
-    ym, yM, xm, xM = max(0, ym-p), min(can.shape[0], yM+p), max(0, xm-p), min(can.shape[1], xM+p)
-    
-    # Cắt dữ liệu ra để xử lý
-    rc = can[ym:yM, xm:xM]
-    ri = img[ym:yM, xm:xM]
-    rwc = wc[ym:yM, xm:xM]
-    rwi = wi[ym:yM, xm:xM]
-    
-    if rc.shape[0] < p or rc.shape[1] < p: return can
+    # Cắt bỏ viền đen thừa
+    gray = cv2.cvtColor(img_cyl, cv2.COLOR_BGR2GRAY)
+    cnts, _ = cv2.findContours(cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)[1], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if cnts:
+        x, y, w, h = cv2.boundingRect(max(cnts, key=cv2.contourArea))
+        img_cyl = img_cyl[y:y+h, x:x+w]
+    return img_cyl
 
-    # --- [NEW] LOGIC XÓA BÓNG MA (DEGHOSTING) ---
-    # Tính sự khác biệt giữa ảnh cũ và ảnh mới tại vùng giao thoa
-    # Chỉ tính ở những nơi cả 2 đều có dữ liệu (rwc > 0 và rwi > 0)
-    overlap = (rwc > 0) & (rwi > 0)
-    if np.sum(overlap) > 0:
-        diff = np.mean(np.abs(rc.astype(np.float32) - ri.astype(np.float32)), axis=2)
+# --- 2. KỸ THUẬT: SIFT/ORB & RANSAC ---
+def get_homography(img1, img2):
+    orb = cv2.ORB_create(nfeatures=ORB_N)
+    kp1, des1 = orb.detectAndCompute(img1, None)
+    kp2, des2 = orb.detectAndCompute(img2, None)
+    
+    if des1 is None or des2 is None: return None
+    
+    # Matcher
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    matches = sorted(bf.match(des1, des2), key=lambda x: x.distance)
+    
+    # Lấy top 20% matches tốt nhất
+    good = matches[:int(len(matches)*0.2)]
+    if len(good) < 5: return None
+    
+    src = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1,1,2)
+    dst = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1,1,2)
+    
+    # RANSAC để lọc nhiễu
+    M, _ = cv2.estimateAffinePartial2D(src, dst, method=cv2.RANSAC)
+    return np.vstack([M, [0,0,1]]) if M is not None else None
+
+# --- 3. KỸ THUẬT: EXPOSURE COMPENSATION ---
+def compensate(img1, img2, m1, m2):
+    # Tìm vùng chồng lấn (overlap)
+    k = np.ones((5,5), np.uint8)
+    ov = cv2.bitwise_and(cv2.erode(m1, k), cv2.erode(m2, k))
+    if not cv2.countNonZero(ov): return img2
+    
+    # Tính trung bình màu vùng chồng lấn
+    mu1 = cv2.mean(img1, mask=ov)[:3]
+    mu2 = cv2.mean(img2, mask=ov)[:3]
+    
+    res = img2.copy()
+    for i in range(3):
+        if mu2[i] > 10 and mu1[i] > 10:
+            # Điều chỉnh độ lợi (Gain compensation)
+            gain = mu1[i] / mu2[i]
+            res[:,:,i] = np.clip(img2[:,:,i] * np.clip(gain, 0.8, 1.2), 0, 255)
+    return res
+
+# --- 4. KỸ THUẬT: MULTI-BAND BLENDING (Pyramid Blending) ---
+def build_gaussian_pyramid(img, levels):
+    G = img.copy()
+    gp = [G]
+    for i in range(levels):
+        G = cv2.pyrDown(G)
+        gp.append(G)
+    return gp
+
+def build_laplacian_pyramid(gp, levels):
+    lp = [gp[levels-1]]
+    for i in range(levels-1, 0, -1):
+        GE = cv2.pyrUp(gp[i])
+        # Resize bắt buộc để khớp kích thước do sai số làm tròn của pyrDown
+        rows, cols = gp[i-1].shape[:2]
+        GE = cv2.resize(GE, (cols, rows))
+        L = cv2.subtract(gp[i-1], GE)
+        lp.append(L)
+    return lp
+
+def multi_band_blend(img1, img2, m1, m2, levels=4):
+    # Chuyển mask sang float để làm trọng số
+    m1f = m1.astype(np.float32) / 255.0
+    m2f = m2.astype(np.float32) / 255.0
+    
+    # Distance transform để tạo mask mềm mịn (seam finding đơn giản)
+    d1 = cv2.distanceTransform(m1, cv2.DIST_L2, 3)
+    d2 = cv2.distanceTransform(m2, cv2.DIST_L2, 3)
+    sum_d = d1 + d2
+    sum_d[sum_d == 0] = 1.0
+    alpha = d1 / sum_d
+    
+    # 1. Tạo Gaussian Pyramid cho mask Alpha
+    gp_alpha = build_gaussian_pyramid(alpha, levels)
+    
+    # 2. Tạo Laplacian Pyramid cho 2 ảnh
+    gp_img1 = build_gaussian_pyramid(img1.astype(np.float32), levels)
+    lp_img1 = build_laplacian_pyramid(gp_img1, levels)
+    gp_img2 = build_gaussian_pyramid(img2.astype(np.float32), levels)
+    lp_img2 = build_laplacian_pyramid(gp_img2, levels)
+    
+    # 3. Trộn (Blend) từng tầng
+    LS = []
+    for l1, l2, mask in zip(lp_img1, lp_img2, gp_alpha[::-1]):
+        rows, cols = l1.shape[:2]
+        if mask.shape[:2] != (rows, cols):
+            mask = cv2.resize(mask, (cols, rows))
+        mask_3c = np.dstack([mask]*3)
+        ls = l1 * mask_3c + l2 * (1.0 - mask_3c)
+        LS.append(ls)
         
-        # Ngưỡng phát hiện bóng ma (lớn hơn 30 là coi như vật thể khác nhau/chuyển động)
-        is_ghost = (diff > 30.0) & overlap
+    # 4. Tái tạo ảnh (Reconstruct)
+    ls_reconstruct = LS[0]
+    for i in range(1, levels):
+        ls_reconstruct = cv2.pyrUp(ls_reconstruct)
+        rows, cols = LS[i].shape[:2]
+        ls_reconstruct = cv2.resize(ls_reconstruct, (cols, rows))
+        ls_reconstruct = cv2.add(ls_reconstruct, LS[i])
         
-        # Winner Takes All: Pixel nào gần tâm hơn (weight lớn hơn) thì giữ lại, xóa pixel kia
-        # Nếu Canvas mạnh hơn: Xóa trọng số của Image
-        mask_kill_i = is_ghost & (rwc > rwi)
-        rwi[mask_kill_i] = 0
+    return np.clip(ls_reconstruct, 0, 255).astype(np.uint8)
+
+# --- 5. KỸ THUẬT: STRAIGHTENING (NẮN THẲNG) ---
+def straighten(img, cents):
+    if len(cents) < 2: return img
+    pts = np.array(cents)
+    
+    # Dùng fitLine thay vì lstsq để chống nhiễu tốt hơn
+    [vx, vy, x, y] = cv2.fitLine(pts.astype(np.float32), cv2.DIST_L2, 0, 0.01, 0.01)
+    angle = np.degrees(np.arctan2(vy, vx))[0]
+    
+    print(f" -> Góc nghiêng phát hiện: {angle:.2f} độ")
+    
+    # Chỉ xoay nếu nghiêng đáng kể (> 0.5 độ)
+    if abs(angle) < 0.5: return img
+    
+    h, w = img.shape[:2]
+    # Xoay ngược chiều kim đồng hồ để bù góc nghiêng
+    M = cv2.getRotationMatrix2D((w//2, h//2), -angle, 1.0)
+    
+    # Tính lại kích thước bounding box để không bị mất góc ảnh
+    cos = np.abs(M[0, 0])
+    sin = np.abs(M[0, 1])
+    nw = int((h * sin) + (w * cos))
+    nh = int((h * cos) + (w * sin))
+    M[0, 2] += (nw / 2) - w / 2
+    M[1, 2] += (nh / 2) - h / 2
+    
+    return cv2.warpAffine(img, M, (nw, nh), flags=cv2.INTER_LANCZOS4)
+
+# --- LOGIC CHÍNH ---
+def process_images(files):
+    try:
+        if not files or len(files) < 2:
+            return None, "Cần tải ít nhất 2 ảnh!"
+
+        # Sắp xếp file theo tên số (1.jpg, 2.jpg...)
+        key = lambda v: [int(c) if c.isdigit() else c for c in re.split(r'(\d+)', os.path.basename(v))]
+        paths = sorted([f.name for f in files], key=key)
         
-        # Nếu Image mạnh hơn: Xóa trọng số của Canvas
-        mask_kill_c = is_ghost & (rwi >= rwc)
-        rwc[mask_kill_c] = 0
-    # --------------------------------------------
-
-    # Chuẩn bị Padding cho Pyramid
-    hp, wp = (BLEND_LVL-(rc.shape[0]%BLEND_LVL))%BLEND_LVL, (BLEND_LVL-(rc.shape[1]%BLEND_LVL))%BLEND_LVL
-    
-    # Copy có border
-    rc = cv2.copyMakeBorder(rc,0,hp,0,wp,2)
-    ri = cv2.copyMakeBorder(ri,0,hp,0,wp,2)
-    rwc = cv2.copyMakeBorder(rwc,0,hp,0,wp,0,value=0)
-    rwi = cv2.copyMakeBorder(rwi,0,hp,0,wp,0,value=0)
-    
-    # Multi-band Blending
-    G1, G2, MW = [rc.astype(float)], [ri.astype(float)], rwc+rwi
-    MW[MW<1e-5]=1.0; A = rwi/MW # Alpha mask lúc này đã sắc nét ở vùng bóng ma (do bước de-ghosting trên)
-    
-    for _ in range(BLEND_LVL): G1.append(cv2.pyrDown(G1[-1])); G2.append(cv2.pyrDown(G2[-1]))
-    L1 = [G1[i]-cv2.pyrUp(G1[i+1],dstsize=G1[i].shape[:2][::-1]) for i in range(BLEND_LVL)] + [G1[-1]]
-    L2 = [G2[i]-cv2.pyrUp(G2[i+1],dstsize=G2[i].shape[:2][::-1]) for i in range(BLEND_LVL)] + [G2[-1]]
-    
-    GA = [A]
-    for _ in range(BLEND_LVL): GA.append(cv2.pyrDown(GA[-1]))
-    
-    R = [L1[i]*(1.0-GA[i][...,None]) + L2[i]*GA[i][...,None] for i in range(len(L1))]
-    res = R[-1]
-    for i in range(len(R)-2,-1,-1): res = cv2.add(cv2.pyrUp(res, dstsize=R[i].shape[:2][::-1]), R[i])
-    
-    # Ghi đè lại vào Canvas
-    can[ym:yM, xm:xM] = np.clip(res,0,255).astype(np.uint8)[:rc.shape[0]-hp, :rc.shape[1]-wp]
-    
-    # Cập nhật lại mask gốc (wc) bằng max weight mới (để lần ghép sau biết chỗ nào là ảnh chính)
-    wc[ym:yM, xm:xM] = np.maximum(wc[ym:yM, xm:xM], wi[ym:yM, xm:xM]) # Cập nhật đơn giản cho vòng sau
-    
-    return can
-
-# ==============================================================================
-# CÁC HÀM KHÁC (GIỮ NGUYÊN)
-# ==============================================================================
-def get_H(i1, i2):
-    s = cv2.SIFT_create(10000)
-    k1, d1 = s.detectAndCompute(cv2.cvtColor(i1,6),None)
-    k2, d2 = s.detectAndCompute(cv2.cvtColor(i2,6),None)
-    if d1 is None or d2 is None: return None, 0
-    m = cv2.FlannBasedMatcher(dict(algorithm=1, trees=5), dict(checks=50)).knnMatch(d1, d2, k=2)
-    g = [x for x, y in m if x.distance < LOWE * y.distance]
-    if len(g) < MIN_MATCH: return None, 0
-    p1 = np.float32([k2[m.trainIdx].pt for m in g]).reshape(-1,1,2)
-    p2 = np.float32([k1[m.queryIdx].pt for m in g]).reshape(-1,1,2)
-    M, mask = cv2.estimateAffinePartial2D(p1, p2, method=cv2.RANSAC, ransacReprojThreshold=RANSAC)
-    return (np.vstack([M, [0,0,1]]), np.sum(mask)) if M is not None else (None, 0)
-
-def pipeline(imgs):
-    n = len(imgs); sc = np.zeros(n)
-    for i in range(n):
-        for j in range(max(0,i-2), min(n,i+3)):
-            if i!=j:
-                h,w = imgs[i].shape[:2]; s = 400/w
-                _, c = get_H(cv2.resize(imgs[i],(0,0),fx=s,fy=s), cv2.resize(imgs[j],(0,0),fx=s,fy=s))
-                if c: sc[i]+=c
-    cid = np.argmax(sc); H_g = [None]*n; H_g[cid] = np.eye(3); q = [cid]; vis = {cid}
-    
-    while q:
-        cur = q.pop(0)
-        for i in sorted(range(n), key=lambda x: abs(x-cur)):
-            if i not in vis:
-                H, c = get_H(imgs[cur], imgs[i])
-                if H is not None and c >= MIN_MATCH: H_g[i] = H_g[cur]@H; vis.add(i); q.append(i)
-    
-    pts = np.concatenate([cv2.perspectiveTransform(np.float32([[0,0],[0,imgs[i].shape[0]],[imgs[i].shape[1],imgs[i].shape[0]],[imgs[i].shape[1],0]]).reshape(-1,1,2), H) for i, H in enumerate(H_g) if H is not None])
-    mn, mx = np.int32(pts.min(0).ravel()-0.5), np.int32(pts.max(0).ravel()+0.5); cw, ch = mx-mn
-    T = np.array([[1,0,-mn[0]],[0,1,-mn[1]],[0,0,1]], dtype=float)
-    if cw*ch > MAX_PIX: s = (MAX_PIX/(cw*ch))**0.5; cw, ch = int(cw*s), int(ch*s); T = np.diag([s,s,1])@T
-    
-    can = np.zeros((ch, cw, 3), np.uint8); wm = np.zeros((ch, cw), np.float32)
-    can = cv2.warpPerspective(imgs[cid], T@H_g[cid], (cw, ch), flags=4)
-    wm = cv2.warpPerspective(get_mask(imgs[cid]), T@H_g[cid], (cw, ch), flags=1)
-    
-    for _, i in sorted([(np.linalg.norm(H_g[i][:2,2]), i) for i, H in enumerate(H_g) if H is not None and i!=cid]):
-        H = T@H_g[i]
-        wi = cv2.warpPerspective(get_mask(imgs[i]), H, (cw, ch), flags=1)
-        # Warp ảnh mới
-        im = match_exp(can, cv2.warpPerspective(imgs[i], H, (cw, ch), flags=4), wm, wi)
+        imgs_raw = []
+        print(f"--- Đang xử lý {len(paths)} ảnh... ---")
         
-        # GỌI HÀM BLEND MỚI
-        # Lưu ý: Ta không cần gc.collect() quá nhiều ở đây nếu RAM đủ, nhưng nên có nếu ảnh to
-        can = blend(can, im, wm, wi)
+        for p in paths:
+            i = cv2.imread(p)
+            if i is None: continue
+            h, w = i.shape[:2]
+            # Resize nếu ảnh quá lớn để tránh tràn RAM
+            imgs_raw.append(cv2.resize(i, None, fx=MAX_W/w, fy=MAX_W/w) if w > MAX_W else i)
         
-        # Cập nhật mask tổng (wm) sau khi đã merge
-        # Lưu ý: Hàm blend đã xử lý de-ghosting trên cục bộ rwc, rwi
-        # Ở đây ta cập nhật wm toàn cục
-        wm = np.maximum(wm, wi) 
-        gc.collect()
+        if len(imgs_raw) < 2: return None, "Lỗi đọc ảnh."
+
+        # Warp trụ
+        imgs = [cylindrical_warp(i, FOCAL_LENGTH) for i in imgs_raw]
+        curr = imgs[0]
+        cents = [(imgs[0].shape[1]/2, imgs[0].shape[0]/2)]
         
-    return can
+        print("\nBắt đầu ghép...")
+        num_imgs = len(imgs)
+        
+        for i in range(1, num_imgs):
+            print(f"... Đang ghép ảnh {i+1}/{num_imgs}")
+            img_new = imgs[i]
+            
+            # Tìm Homography
+            H = get_homography(curr, img_new)
+            
+            # Nếu không tìm thấy, thử cắt lấy phần đuôi ảnh trước để tìm lại (overlap area)
+            if H is None:
+                tail = int(curr.shape[1] * 0.5) # Lấy 50% ảnh cuối
+                Hr = get_homography(curr[:, -tail:], img_new)
+                if Hr is None:
+                    print(f" -> CẢNH BÁO: Không khớp được ảnh {i+1}, bỏ qua."); continue
+                H = np.array([[1, 0, curr.shape[1] - tail], [0, 1, 0], [0, 0, 1]]).dot(Hr)
+            
+            # Tính kích thước canvas mới
+            h1, w1 = curr.shape[:2]; h2, w2 = img_new.shape[:2]
+            corners_new = cv2.perspectiveTransform(np.float32([[0,0],[0,h2],[w2,h2],[w2,0]]).reshape(-1,1,2), H).reshape(-1,2)
+            pts = np.concatenate(([[0,0],[0,h1],[w1,h1],[w1,0]], corners_new))
+            xmin, ymin = np.int32(pts.min(0) - 0.5); xmax, ymax = np.int32(pts.max(0) + 0.5)
+            
+            # Ma trận dịch chuyển
+            T = np.array([[1, 0, -xmin], [0, 1, -ymin], [0, 0, 1]], dtype=np.float32)
+            H_final = T.dot(H)
+            
+            # Cập nhật tâm ảnh để nắn thẳng sau này
+            new_center = cv2.perspectiveTransform(np.array([[[w2/2, h2/2]]], dtype=np.float32), H_final)[0,0]
+            cents = [(cx-xmin, cy-ymin) for cx, cy in cents] + [tuple(new_center)]
+            
+            # Warp ảnh
+            wb = cv2.warpPerspective(curr, T, (xmax-xmin, ymax-ymin))
+            wn = cv2.warpPerspective(img_new, H_final, (xmax-xmin, ymax-ymin))
+            
+            # Tạo mask
+            mb = cv2.threshold(cv2.cvtColor(wb, cv2.COLOR_BGR2GRAY), 1, 255, cv2.THRESH_BINARY)[1]
+            mn = cv2.threshold(cv2.cvtColor(wn, cv2.COLOR_BGR2GRAY), 1, 255, cv2.THRESH_BINARY)[1]
+            
+            # Cân bằng sáng (Exposure Compensation)
+            wn_compensated = compensate(wb, wn, mb, mn)
+            
+            # Ghép đa tần số (Multi-band Blending)
+            curr = multi_band_blend(wb, wn_compensated, mb, mn, levels=4)
+            
+            gc.collect() # Dọn RAM
 
-def post_process(img):
-    h, w = img.shape[:2]; _, t = cv2.threshold(cv2.cvtColor(img, 6), 1, 255, 0)
-    idx = [np.where(t[:,x]>0)[0] for x in range(w)]
-    valid = [(x, (i[0]+i[-1])/2) for x, i in enumerate(idx) if len(i)>h*0.2]
-    if valid:
-        poly = np.poly1d(np.polyfit([v[0] for v in valid], [v[1] for v in valid], 2)); res = np.zeros_like(img)
-        for x in range(w):
-            sh = int(h/2 - poly(x)); col = img[:,x]
-            if sh > 0: res[sh:,x] = col[:h-sh]
-            elif sh < 0: res[:h+sh,x] = col[-sh:]
-            else: res[:,x] = col
-        img = res
-    img = crop(img); _, m = cv2.threshold(cv2.cvtColor(img, 6), 1, 255, 1) 
-    img = cv2.inpaint(img, m, 3, cv2.INPAINT_TELEA) if np.sum(m) > 100 else img
-    return np.clip(cv2.addWeighted(img, 2.0, cv2.GaussianBlur(img, (0,0), 3.0), -1.0, 0), 0, 255).astype(np.uint8)
+        print("Đang nắn thẳng (Straightening)...")
+        final = straighten(curr, cents)
+        
+        # Crop bỏ viền đen lần cuối
+        gray_final = cv2.cvtColor(final, cv2.COLOR_BGR2GRAY)
+        _, thresh = cv2.threshold(gray_final, 1, 255, cv2.THRESH_BINARY)
+        x, y, w, h = cv2.boundingRect(thresh)
+        final = final[y:y+h, x:x+w]
+        
+        final_rgb = cv2.cvtColor(final, cv2.COLOR_BGR2RGB)
+        return final_rgb, "Ghép ảnh thành công! (Đã dùng Multi-band Blending)"
+        
+    except Exception as e:
+        print(f"LỖI: {str(e)}")
+        return None, f"Lỗi: {str(e)}"
 
-if __name__ == '__main__':
-    imgs = [cv2.imread(f"img3/{f}") for f in sorted(os.listdir("img3")) if f.endswith(('.jpg','.png'))]
-    if len(imgs) > 1:
-        res = pipeline(imgs)
-        if res is not None: cv2.imwrite("result_deghost.jpg", post_process(res), [cv2.IMWRITE_JPEG_QUALITY, 100])
+# --- GIAO DIỆN GRADIO ---
+with gr.Blocks(title="Panorama Stitcher Pro") as demo:
+    gr.Markdown("# 📸 Panorama Stitcher (Full Tech)")
+    gr.Markdown("Đã tích hợp: SIFT/ORB, RANSAC, Warp, Exposure Comp, Multi-band Blending.")
+    
+    with gr.Row():
+        with gr.Column(scale=1):
+            file_input = gr.File(file_count="multiple", label="Tải ảnh lên (Thứ tự trái -> phải)")
+            btn_run = gr.Button("Bắt đầu Ghép", variant="primary")
+            status_text = gr.Textbox(label="Log", interactive=False) 
+        with gr.Column(scale=3):
+            image_output = gr.Image(label="Kết quả Panorama", type="numpy", interactive=False)
+
+    btn_run.click(process_images, inputs=file_input, outputs=[image_output, status_text])
+
+if __name__ == "__main__":
+    demo.launch(share=True)
